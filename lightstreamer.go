@@ -101,10 +101,10 @@ type ChartCandle struct {
 type TradeUpdate struct {
 	AccountID          string
 	RecvTime           time.Time
-	RawUpdate          string              // The raw payload from the lightstreamer API
-	Confirms           TradeUpdateConfirms `lightstreamer:"CONFIRMS,tradeUpdateConfirms"`
-	OpenPositionUpdate TradeUpdateOPU      `lightstreamer:"OPU,tradeUpdateOPU"`
-	WorkingOrderUpdate TradeUpdateWOU      `lightstreamer:"WOU,tradeUpdateWOU"`
+	RawUpdate          string               // The raw payload from the lightstreamer API
+	Confirms           *TradeUpdateConfirms `lightstreamer:"CONFIRMS,tradeUpdateConfirms"`
+	OpenPositionUpdate *TradeUpdateOPU      `lightstreamer:"OPU,tradeUpdateOPU"`
+	WorkingOrderUpdate *TradeUpdateWOU      `lightstreamer:"WOU,tradeUpdateWOU"`
 }
 
 type DealingWindow struct {
@@ -242,18 +242,18 @@ func init() {
 			return reflect.ValueOf(MarketState(0).Parse(s)), nil
 		},
 		"tradeUpdateConfirms": func(ls *LightStreamerConnection, accountID, s string) (reflect.Value, error) {
-			confirms := TradeUpdateConfirms{}
-			err := json.Unmarshal([]byte(s), &confirms)
+			confirms := &TradeUpdateConfirms{}
+			err := json.Unmarshal([]byte(s), confirms)
 			return reflect.ValueOf(confirms), err
 		},
 		"tradeUpdateOPU": func(ls *LightStreamerConnection, accountID, s string) (reflect.Value, error) {
-			opu := TradeUpdateOPU{}
-			err := json.Unmarshal([]byte(s), &opu)
+			opu := &TradeUpdateOPU{}
+			err := json.Unmarshal([]byte(s), opu)
 			return reflect.ValueOf(opu), err
 		},
 		"tradeUpdateWOU": func(ls *LightStreamerConnection, accountID, s string) (reflect.Value, error) {
-			wou := TradeUpdateWOU{}
-			err := json.Unmarshal([]byte(s), &wou)
+			wou := &TradeUpdateWOU{}
+			err := json.Unmarshal([]byte(s), wou)
 			return reflect.ValueOf(wou), err
 		},
 		"boolFromInt": func(ls *LightStreamerConnection, epic, s string) (reflect.Value, error) {
