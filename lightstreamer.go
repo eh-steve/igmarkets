@@ -107,28 +107,38 @@ type TradeUpdate struct {
 	WorkingOrderUpdate TradeUpdateWOU      `lightstreamer:"WOU,tradeUpdateWOU"`
 }
 
+type DealingWindow struct {
+	Size   float64 `json:"size"`
+	Expiry int64   `json:"expiry"`
+}
+
+type RepeatDealingWindow struct {
+	Entries []DealingWindow `json:"entries"`
+}
+
 type TradeUpdateConfirms struct {
-	Date           string   `json:"date"`
-	LimitDistance  *float64 `json:"limitDistance"`
-	Reason         string   `json:"reason"`
-	LimitLevel     *float64 `json:"limitLevel"`
-	Level          *float64 `json:"level"`
-	DealID         string   `json:"dealId"`
-	Channel        string   `json:"channel"`
-	Epic           string   `json:"epic"`
-	DealReference  string   `json:"dealReference"`
-	DealStatus     string   `json:"dealStatus"`
-	TrailingStop   bool     `json:"trailingStop"`
-	Size           *float64 `json:"size"`
-	StopLevel      *float64 `json:"stopLevel"`
-	StopDistance   *float64 `json:"stopDistance"`
-	ProfitCurrency *string  `json:"profitCurrency"`
-	Expiry         *string  `json:"expiry"`
-	Profit         *float64 `json:"profit"`
-	AffectedDeals  []string `json:"affectedDeals"`
-	GuaranteedStop bool     `json:"guaranteedStop"`
-	Direction      string   `json:"direction"`
-	Status         *string  `json:"status"`
+	Date                string              `json:"date"`
+	LimitDistance       *float64            `json:"limitDistance"`
+	Reason              string              `json:"reason"`
+	LimitLevel          *float64            `json:"limitLevel"`
+	Level               *float64            `json:"level"`
+	DealID              string              `json:"dealId"`
+	Channel             string              `json:"channel"`
+	Epic                string              `json:"epic"`
+	DealReference       string              `json:"dealReference"`
+	DealStatus          string              `json:"dealStatus"`
+	TrailingStop        bool                `json:"trailingStop"`
+	Size                *float64            `json:"size"`
+	StopLevel           *float64            `json:"stopLevel"`
+	StopDistance        *float64            `json:"stopDistance"`
+	ProfitCurrency      *string             `json:"profitCurrency"`
+	Expiry              *string             `json:"expiry"`
+	Profit              *float64            `json:"profit"`
+	AffectedDeals       []AffectedDeal      `json:"affectedDeals"`
+	RepeatDealingWindow RepeatDealingWindow `json:"repeatDealingWindow"`
+	GuaranteedStop      bool                `json:"guaranteedStop"`
+	Direction           string              `json:"direction"`
+	Status              *string             `json:"status"`
 }
 
 type TradeUpdateOPU struct {
