@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -483,6 +484,7 @@ func (ls *LightStreamerConnection) bindSession() error {
 }
 
 func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
+	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("func", "LightStreamerConnection.writeLoop")))
 	for {
 		select {
 		case <-ls.heartbeatTicker.C:
@@ -607,6 +609,7 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 }
 
 func (ls *LightStreamerConnection) readLoop() {
+	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("func", "LightStreamerConnection.readLoop")))
 	for !ls.closeRequested.Load() {
 		_, msg, err := ls.wsConn.ReadMessage()
 		if err != nil {
@@ -917,8 +920,10 @@ func (ls *LightStreamerConnection) fatalError(err error) {
 	ls.lastError = err
 
 	log.Printf("lightstreamer encountered connection error - recreating subscriptions: %s\n", err)
-
-	expBackoff := backoff.WithContext(backoff.NewExponentialBackOff(), ls.ctx)
+	expBackoff := backoff.NewExponentialBackOff()
+	expBackoff.MaxElapsedTime = 0
+	expBackoff.MaxInterval = 10 * time.Second
+	backOff := backoff.WithContext(expBackoff, ls.ctx)
 	err = backoff.RetryNotify(func() error {
 		lsNew, err := ls.ig.NewLightStreamerConnection(ls.ctx)
 		if err != nil {
@@ -926,7 +931,7 @@ func (ls *LightStreamerConnection) fatalError(err error) {
 		}
 		// Reuse the old subscription requests so the channels are re-used
 		for _, ms := range ls.marketSubscriptions {
-			_, err = subscribe(ls, ls.ctx, *ms)
+			_, err = subscribe(lsNew, lsNew.ctx, *ms)
 			if err != nil {
 				_ = lsNew.Close()
 				return err
@@ -934,14 +939,14 @@ func (ls *LightStreamerConnection) fatalError(err error) {
 		}
 
 		for _, cs := range ls.chartTickSubscriptions {
-			_, err = subscribe(ls, ls.ctx, *cs)
+			_, err = subscribe(lsNew, lsNew.ctx, *cs)
 			if err != nil {
 				_ = lsNew.Close()
 				return err
 			}
 		}
 		for _, ts := range ls.tradeSubscriptions {
-			_, err = subscribe(ls, ls.ctx, *ts)
+			_, err = subscribe(lsNew, lsNew.ctx, *ts)
 			if err != nil {
 				_ = lsNew.Close()
 				return err
@@ -953,7 +958,7 @@ func (ls *LightStreamerConnection) fatalError(err error) {
 
 		*ls = *lsNew
 		return nil
-	}, expBackoff, func(err error, duration time.Duration) {
+	}, backOff, func(err error, duration time.Duration) {
 		log.Printf("lightstreamer encountered connection error (retrying in %s): %s\n", duration, err)
 	})
 	if err != nil {
@@ -961,44 +966,44 @@ func (ls *LightStreamerConnection) fatalError(err error) {
 	}
 }
 
-func (ls *LightStreamerConnection) SubscribeTradeUpdates(ctx context.Context, accounts ...string) (<-chan TradeUpdate, error) {
+func (ls *LightStreamerConnection) SubscribeTradeUpdates(ctx context.Context, bufferSize int, accounts ...string) (<-chan TradeUpdate, error) {
 	if ls.closeRequested.Load() {
 		return nil, fmt.Errorf("cannot subscribe using a closed lightstreamer connection")
 	}
 
-	return subscribe(ls, ctx, makeNewSubscription[TradeUpdate](accounts))
+	return subscribe(ls, ctx, makeNewSubscription[TradeUpdate](accounts, bufferSize))
 }
 
 func (ls *LightStreamerConnection) UnsubscribeTradeUpdates(tickChan <-chan TradeUpdate) error {
 	return unsubscribe(ls, tickChan)
 }
 
-func (ls *LightStreamerConnection) SubscribeChartTicks(ctx context.Context, epics ...string) (<-chan ChartTick, error) {
+func (ls *LightStreamerConnection) SubscribeChartTicks(ctx context.Context, bufferSize int, epics ...string) (<-chan ChartTick, error) {
 	if ls.closeRequested.Load() {
 		return nil, fmt.Errorf("cannot subscribe using a closed lightstreamer connection")
 	}
-	return subscribe(ls, ctx, makeNewSubscription[ChartTick](epics))
+	return subscribe(ls, ctx, makeNewSubscription[ChartTick](epics, bufferSize))
 }
 
 func (ls *LightStreamerConnection) UnsubscribeChartTicks(tickChan <-chan ChartTick) error {
 	return unsubscribe(ls, tickChan)
 }
 
-func (ls *LightStreamerConnection) SubscribeMarkets(ctx context.Context, epics ...string) (<-chan MarketTick, error) {
+func (ls *LightStreamerConnection) SubscribeMarkets(ctx context.Context, bufferSize int, epics ...string) (<-chan MarketTick, error) {
 	if ls.closeRequested.Load() {
 		return nil, fmt.Errorf("cannot subscribe using a closed lightstreamer connection")
 	}
 
-	return subscribe(ls, ctx, makeNewSubscription[MarketTick](epics))
+	return subscribe(ls, ctx, makeNewSubscription[MarketTick](epics, bufferSize))
 }
 
 func (ls *LightStreamerConnection) UnsubscribeMarkets(tickChan <-chan MarketTick) error {
 	return unsubscribe(ls, tickChan)
 }
 
-func makeNewSubscription[T MarketTick | ChartTick | TradeUpdate](items []string) subscription[T] {
+func makeNewSubscription[T MarketTick | ChartTick | TradeUpdate](items []string, bufferSize int) subscription[T] {
 	subReq := subscription[T]{
-		channel: make(chan T),
+		channel: make(chan T, bufferSize),
 		items:   items,
 		errChan: make(chan error),
 	}
