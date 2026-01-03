@@ -145,23 +145,37 @@ func main() {
 
 More examples can be found [here](https://github.com/sklinkert/igmarkets/tree/master/examples).
 
-### LightStreamer API Subscription Example
+### Lightstreamer API (websocket) subscription example
 
 ```go
-    var ctx = context.Background()
-	for {
-		tickChan := make(chan igmarkets.LightStreamerTick)
-    err := igHandle.OpenLightStreamerSubscription(ctx, []string{"CS.D.BITCOIN.CFD.IP"}, tickChan)
-		if err != nil {
-      log.WithError(err).Error("OpenLightStreamerSubscription() failed")
-		}
+ctx := context.Background()
 
-		for tick := range tickChan {
-			log.Infof("tick: %+v", tick)
-		}
+for {
+	lsConn, err := igHandle.NewLightStreamerConnection(ctx)
+	if err != nil {
+		log.WithError(err).Error("NewLightStreamerConnection() failed")
+		time.Sleep(2 * time.Second)
+		continue
+	}
 
-		log.Infof("Server closed stream, restarting...")
-  }
+	tickChan, err := lsConn.SubscribeMarkets(ctx, 100, "CS.D.BITCOIN.CFD.IP")
+	if err != nil {
+		_ = lsConn.Close()
+		log.WithError(err).Error("SubscribeMarkets() failed")
+		time.Sleep(2 * time.Second)
+		continue
+	}
+
+	for tick := range tickChan {
+		log.Infof("tick: %+v", tick)
+	}
+
+	// Stream ended (connection error or Close()).
+	if err := lsConn.Close(); err != nil {
+		log.WithError(err).Warn("lightstreamer stream ended")
+	}
+	log.Infof("Stream ended, restarting...")
+}
 ```
 
 Output:

@@ -14,10 +14,10 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
 )
@@ -32,8 +32,14 @@ type LightStreamerConnection struct {
 	heartbeatTicker          *time.Ticker
 	ctx                      context.Context
 	cancelFunc               func()
+	cycleCancel              context.CancelFunc
+	errMu                    sync.Mutex
 	lastError                error
 	closeRequested           atomic.Bool
+	reconnectCh              chan error
+	subsMu                   sync.RWMutex
+	wg                       sync.WaitGroup
+	done                     chan struct{}
 	marketSubscriptions      []*subscription[MarketTick]
 	chartTickSubscriptions   []*subscription[ChartTick]
 	chartCandleSubscriptions []*subscription[ChartCandle]
@@ -239,7 +245,9 @@ func init() {
 				// TODO - check whether we fetched the last price recently, and reuse it, otherwise fetch it again
 				times, ok := ls.priceTimestampsByEpic[epic]
 				if !ok || now.Sub(times.fetchTime).Seconds() > 3600 {
-					priceResp, err := ls.ig.GetPriceHistory(ls.ctx, epic, "SECOND", 1, time.Time{}, time.Time{})
+					priceCtx, cancel := context.WithTimeout(ls.ctx, 5*time.Second)
+					priceResp, err := ls.ig.GetPriceHistory(priceCtx, epic, "SECOND", 1, time.Time{}, time.Time{})
+					cancel()
 					if err != nil || len(priceResp.Prices) != 1 {
 						log.Printf("failed to fetch price history for epic '%s' - received ambiguous time %s but could not determine date: %v\n", epic, s, err)
 						times.priceTime = time.Time{}
@@ -349,8 +357,10 @@ func (ig *IGMarkets) NewLightStreamerConnection(ctx context.Context) (*LightStre
 	lsConn := &LightStreamerConnection{
 		ig:                    ig,
 		nextSubscriptionId:    1,
-		subscriptionReqChan:   make(chan interface{}),
+		subscriptionReqChan:   make(chan interface{}, 64),
 		priceTimestampsByEpic: make(map[string]struct{ fetchTime, priceTime time.Time }),
+		done:                  make(chan struct{}),
+		reconnectCh:           make(chan error, 1),
 	}
 
 	ctx, lsConn.cancelFunc = context.WithCancel(ctx)
@@ -362,11 +372,12 @@ func (ig *IGMarkets) NewLightStreamerConnection(ctx context.Context) (*LightStre
 	}
 
 	dialer := &websocket.Dialer{
-		Subprotocols: []string{LightstreamerProtocolVersion},
+		Subprotocols:     []string{LightstreamerProtocolVersion},
+		HandshakeTimeout: 30 * time.Second,
 	}
 
 	endpoint := strings.Replace(strings.Replace(sessionVersion2.LightstreamerEndpoint, "https://", "wss://", 1), "http://", "ws://", 1)
-	ws, resp, err := dialer.Dial(fmt.Sprintf("%s/lightstreamer", endpoint), http.Header{})
+	ws, resp, err := dialer.DialContext(ctx, fmt.Sprintf("%s/lightstreamer", endpoint), http.Header{})
 	if err != nil {
 		if resp != nil {
 			respBody, err := io.ReadAll(resp.Body)
@@ -421,10 +432,14 @@ func (ig *IGMarkets) NewLightStreamerConnection(ctx context.Context) (*LightStre
 		return nil, fmt.Errorf("error setting empty write deadline: %w", err)
 	}
 
-	lsConn.heartbeatTicker = time.NewTicker(5 * time.Second)
-	go lsConn.readLoop()
+	cycleCtx, cycleCancel := context.WithCancel(lsConn.ctx)
+	lsConn.cycleCancel = cycleCancel
 
-	go lsConn.writeLoop(ctx)
+	lsConn.heartbeatTicker = time.NewTicker(5 * time.Second)
+	lsConn.wg.Add(2)
+	go lsConn.readLoop()
+	go lsConn.writeLoop(cycleCtx)
+	go lsConn.supervise()
 
 	return lsConn, nil
 }
@@ -520,6 +535,7 @@ func (ls *LightStreamerConnection) bindSession() error {
 
 func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("func", "LightStreamerConnection.writeLoop")))
+	defer ls.wg.Done()
 	for {
 		select {
 		case <-ls.heartbeatTicker.C:
@@ -531,6 +547,7 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 				if !ls.closeRequested.Load() {
 					ls.fatalError(err)
 				}
+				return
 			}
 		case <-ctx.Done():
 			return
@@ -564,7 +581,9 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 					return
 				}
 
+				ls.subsMu.Lock()
 				ls.chartTickSubscriptions = append(ls.chartTickSubscriptions, &subReq)
+				ls.subsMu.Unlock()
 				// Read loop should handle REQOK/SUBOK/ERROR
 			case subscription[MarketTick]:
 				ls.nextSubscriptionId++
@@ -589,13 +608,15 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 				err := ls.wsConn.WriteMessage(websocket.TextMessage, msg)
 				if err != nil {
 					subReq.errChan <- err
-					ls.lastError = err
+					ls.setLastError(err)
 					if !ls.closeRequested.Load() {
 						ls.fatalError(err)
 					}
 					return
 				}
+				ls.subsMu.Lock()
 				ls.marketSubscriptions = append(ls.marketSubscriptions, &subReq)
+				ls.subsMu.Unlock()
 				// Read loop should handle REQOK/SUBOK/ERROR
 			case subscription[TradeUpdate]:
 				ls.nextSubscriptionId++
@@ -625,7 +646,9 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 					return
 				}
 
+				ls.subsMu.Lock()
 				ls.tradeSubscriptions = append(ls.tradeSubscriptions, &subReq)
+				ls.subsMu.Unlock()
 				// Read loop should handle REQOK/SUBOK/ERROR
 			case subscription[ChartCandle]:
 				ls.nextSubscriptionId++
@@ -655,19 +678,21 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 					return
 				}
 
+				ls.subsMu.Lock()
 				ls.chartCandleSubscriptions = append(ls.chartCandleSubscriptions, &subReq)
+				ls.subsMu.Unlock()
 				// Read loop should handle REQOK/SUBOK/ERROR
 			case unsubscription[MarketTick]:
-				sendUnsubscribeRequest(ls, subReq, ls.marketSubscriptions)
+				sendUnsubscribeRequest(ls, subReq, &ls.marketSubscriptions)
 				// reader will receive UNSUB
 			case unsubscription[ChartTick]:
-				sendUnsubscribeRequest(ls, subReq, ls.chartTickSubscriptions)
+				sendUnsubscribeRequest(ls, subReq, &ls.chartTickSubscriptions)
 				// reader will receive UNSUB
 			case unsubscription[TradeUpdate]:
-				sendUnsubscribeRequest(ls, subReq, ls.tradeSubscriptions)
+				sendUnsubscribeRequest(ls, subReq, &ls.tradeSubscriptions)
 				// reader will receive UNSUB
 			case unsubscription[ChartCandle]:
-				sendUnsubscribeRequest(ls, subReq, ls.chartCandleSubscriptions)
+				sendUnsubscribeRequest(ls, subReq, &ls.chartCandleSubscriptions)
 				// reader will receive UNSUB
 			default:
 				panic(fmt.Sprintf("unknown subscription request type %T", subReqI))
@@ -678,6 +703,7 @@ func (ls *LightStreamerConnection) writeLoop(ctx context.Context) {
 
 func (ls *LightStreamerConnection) readLoop() {
 	pprof.SetGoroutineLabels(pprof.WithLabels(context.Background(), pprof.Labels("func", "LightStreamerConnection.readLoop")))
+	defer ls.wg.Done()
 	for !ls.closeRequested.Load() {
 		_, msg, err := ls.wsConn.ReadMessage()
 		if err != nil {
@@ -707,6 +733,7 @@ func (ls *LightStreamerConnection) readLoop() {
 				if !ls.closeRequested.Load() {
 					ls.fatalError(fmt.Errorf("server sent LOOP message"))
 				}
+				return
 			case "U":
 				ls.handleUpdate(csvResp)
 			default:
@@ -729,7 +756,15 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 		return
 	}
 	itemIdIndex--
-	for _, sub := range ls.marketSubscriptions {
+
+	ls.subsMu.RLock()
+	marketSubscriptions := append([]*subscription[MarketTick](nil), ls.marketSubscriptions...)
+	chartTickSubscriptions := append([]*subscription[ChartTick](nil), ls.chartTickSubscriptions...)
+	chartCandleSubscriptions := append([]*subscription[ChartCandle](nil), ls.chartCandleSubscriptions...)
+	tradeSubscriptions := append([]*subscription[TradeUpdate](nil), ls.tradeSubscriptions...)
+	ls.subsMu.RUnlock()
+
+	for _, sub := range marketSubscriptions {
 		if sub.subscriptionId == subID {
 			if itemIdIndex < 0 || itemIdIndex >= len(sub.items) {
 				log.Printf("epic index %d out of range\n", itemIdIndex)
@@ -746,13 +781,17 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 				log.Printf("failed to parse update %s: %s\n", args[3], err)
 				return
 			}
-			sub.channel <- marketTick
+			select {
+			case sub.channel <- marketTick:
+			default:
+				log.Printf("WARNING - dropping market tick for %s: channel full\n", epic)
+			}
 			sub.lastStateByItem[epic] = marketTick
 			return
 		}
 	}
 
-	for _, sub := range ls.chartTickSubscriptions {
+	for _, sub := range chartTickSubscriptions {
 		if sub.subscriptionId == subID {
 			if itemIdIndex < 0 || itemIdIndex >= len(sub.items) {
 				log.Printf("epic index %d out of range\n", itemIdIndex)
@@ -769,13 +808,17 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 				log.Printf("failed to parse update %s: %s\n", args[3], err)
 				return
 			}
-			sub.channel <- chartTick
+			select {
+			case sub.channel <- chartTick:
+			default:
+				log.Printf("WARNING - dropping chart tick for %s: channel full\n", epic)
+			}
 			sub.lastStateByItem[epic] = chartTick
 			return
 		}
 	}
 
-	for _, sub := range ls.chartCandleSubscriptions {
+	for _, sub := range chartCandleSubscriptions {
 		if sub.subscriptionId == subID {
 			if itemIdIndex < 0 || itemIdIndex >= len(sub.items) {
 				log.Printf("epic index %d out of range\n", itemIdIndex)
@@ -793,13 +836,17 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 				log.Printf("failed to parse update %s: %s\n", args[3], err)
 				return
 			}
-			sub.channel <- chartCandle
+			select {
+			case sub.channel <- chartCandle:
+			default:
+				log.Printf("WARNING - dropping chart candle for %s: channel full\n", epic)
+			}
 			sub.lastStateByItem[epic] = chartCandle
 			return
 		}
 	}
 
-	for _, sub := range ls.tradeSubscriptions {
+	for _, sub := range tradeSubscriptions {
 		if sub.subscriptionId == subID {
 			if itemIdIndex < 0 || itemIdIndex >= len(sub.items) {
 				log.Printf("account ID index %d out of range\n", itemIdIndex)
@@ -816,7 +863,11 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 				log.Printf("failed to parse update %s: %s\n", args[3], err)
 				return
 			}
-			sub.channel <- tradeUpdate
+			select {
+			case sub.channel <- tradeUpdate:
+			default:
+				log.Printf("WARNING - dropping trade update for account %s: channel full\n", accountID)
+			}
 			sub.lastStateByItem[accountID] = tradeUpdate
 			return
 		}
@@ -873,10 +924,12 @@ func (ls *LightStreamerConnection) handleReqErr(args []string) {
 		log.Printf("expected 4 fields in REQERR message, got: %s\n", args)
 		return
 	}
+	ls.subsMu.RLock()
 	handleReqErr(args, ls.marketSubscriptions)
 	handleReqErr(args, ls.chartTickSubscriptions)
 	handleReqErr(args, ls.tradeSubscriptions)
 	handleReqErr(args, ls.chartCandleSubscriptions)
+	ls.subsMu.RUnlock()
 }
 
 func handleReqErr[T MarketTick | ChartTick | ChartCandle | TradeUpdate](args []string, subs []*subscription[T]) {
@@ -885,37 +938,49 @@ func handleReqErr[T MarketTick | ChartTick | ChartCandle | TradeUpdate](args []s
 		if sub.requestID == reqID {
 			select {
 			case sub.errChan <- fmt.Errorf("request error: code: %s, message: %s", args[2], args[3]):
+			default:
 			}
 			break
 		}
 	}
 }
 
-func sendUnsubscribeRequest[T MarketTick | ChartTick | ChartCandle | TradeUpdate](ls *LightStreamerConnection, unSubReq unsubscription[T], subs []*subscription[T]) {
-	found := false
-	for _, sub := range subs {
-		if sub.channel == unSubReq.channel {
-			found = true
-			ctrlVals := url.Values{}
-			sub.errChan = unSubReq.errChan
-			ctrlVals.Set("LS_op", "delete")
-			ctrlVals.Set("LS_subId", fmt.Sprintf("%s", sub.subscriptionId))
-			ctrlVals.Set("LS_reqId", fmt.Sprintf("%d", rand.Int63()))
-			msg := []byte("control\r\n" + ctrlVals.Encode())
+func sendUnsubscribeRequest[T MarketTick | ChartTick | ChartCandle | TradeUpdate](ls *LightStreamerConnection, unSubReq unsubscription[T], subs *[]*subscription[T]) {
+	var target *subscription[T]
 
-			err := ls.wsConn.WriteMessage(websocket.TextMessage, msg)
-			if err != nil {
-				unSubReq.errChan <- err
-				ls.lastError = err
-				if !ls.closeRequested.Load() {
-					ls.fatalError(err)
-				}
-			}
+	ls.subsMu.Lock()
+	for _, sub := range *subs {
+		if sub.channel == unSubReq.channel {
+			target = sub
+			sub.errChan = unSubReq.errChan
 			break
 		}
 	}
-	if !found {
-		unSubReq.errChan <- fmt.Errorf("market subscription not found")
+	ls.subsMu.Unlock()
+
+	if target == nil {
+		select {
+		case unSubReq.errChan <- fmt.Errorf("subscription not found"):
+		default:
+		}
+		return
+	}
+
+	ctrlVals := url.Values{}
+	ctrlVals.Set("LS_op", "delete")
+	ctrlVals.Set("LS_subId", fmt.Sprintf("%s", target.subscriptionId))
+	ctrlVals.Set("LS_reqId", fmt.Sprintf("%d", rand.Int63()))
+	msg := []byte("control\r\n" + ctrlVals.Encode())
+
+	err := ls.wsConn.WriteMessage(websocket.TextMessage, msg)
+	if err != nil {
+		select {
+		case unSubReq.errChan <- err:
+		default:
+		}
+		if !ls.closeRequested.Load() {
+			ls.fatalError(err)
+		}
 	}
 }
 
@@ -926,10 +991,12 @@ func (ls *LightStreamerConnection) handleSubOk(args []string) {
 	}
 
 	subID := args[1]
+	ls.subsMu.RLock()
 	for _, sub := range ls.marketSubscriptions {
 		if sub.subscriptionId == subID {
 			select {
 			case sub.errChan <- nil:
+			default:
 			}
 			break
 		}
@@ -938,6 +1005,7 @@ func (ls *LightStreamerConnection) handleSubOk(args []string) {
 		if sub.subscriptionId == subID {
 			select {
 			case sub.errChan <- nil:
+			default:
 			}
 			break
 		}
@@ -946,6 +1014,7 @@ func (ls *LightStreamerConnection) handleSubOk(args []string) {
 		if sub.subscriptionId == subID {
 			select {
 			case sub.errChan <- nil:
+			default:
 			}
 			break
 		}
@@ -954,10 +1023,12 @@ func (ls *LightStreamerConnection) handleSubOk(args []string) {
 		if sub.subscriptionId == subID {
 			select {
 			case sub.errChan <- nil:
+			default:
 			}
 			break
 		}
 	}
+	ls.subsMu.RUnlock()
 }
 
 func (ls *LightStreamerConnection) handleUnsubscribe(args []string) {
@@ -967,28 +1038,35 @@ func (ls *LightStreamerConnection) handleUnsubscribe(args []string) {
 	}
 
 	subID := args[1]
+	ls.subsMu.Lock()
 	handleUnsubscribe(subID, &ls.marketSubscriptions)
 	handleUnsubscribe(subID, &ls.chartTickSubscriptions)
 	handleUnsubscribe(subID, &ls.tradeSubscriptions)
 	handleUnsubscribe(subID, &ls.chartCandleSubscriptions)
+	ls.subsMu.Unlock()
 }
 
 func handleUnsubscribe[T MarketTick | ChartTick | ChartCandle | TradeUpdate](subID string, subs *[]*subscription[T]) {
 	var foundIndex int
 	var found bool
+	var foundSub *subscription[T]
 	for i, sub := range *subs {
 		if sub.subscriptionId == subID {
 			found = true
 			foundIndex = i
-			select {
-			case sub.errChan <- nil:
-				close(sub.channel)
-			}
+			foundSub = sub
 			break
 		}
 	}
 	if found {
 		*subs = append((*subs)[:foundIndex], (*subs)[foundIndex+1:]...)
+		if foundSub != nil {
+			select {
+			case foundSub.errChan <- nil:
+			default:
+			}
+			safeCloseChan(foundSub.channel)
+		}
 	}
 }
 
@@ -1021,60 +1099,362 @@ func (ls *LightStreamerConnection) handleEnd(args []string) {
 }
 
 func (ls *LightStreamerConnection) fatalError(err error) {
-	ls.lastError = err
+	if ls.closeRequested.Load() {
+		return
+	}
+	if err == nil {
+		err = fmt.Errorf("lightstreamer fatal error")
+	}
+	log.Printf("lightstreamer connection error: %v\n", err)
+	ls.setLastError(err)
+	select {
+	case ls.reconnectCh <- err:
+	default:
+	}
+}
 
-	log.Printf("lightstreamer encountered connection error - recreating subscriptions: %s\n", err)
-	expBackoff := backoff.NewExponentialBackOff()
-	expBackoff.MaxElapsedTime = 0
-	expBackoff.MaxInterval = 10 * time.Second
-	backOff := backoff.WithContext(expBackoff, ls.ctx)
-	err = backoff.RetryNotify(func() error {
-		lsNew, err := ls.ig.NewLightStreamerConnection(ls.ctx)
-		if err != nil {
+func (ls *LightStreamerConnection) setLastError(err error) {
+	if err == nil {
+		return
+	}
+	ls.errMu.Lock()
+	if ls.lastError == nil {
+		ls.lastError = err
+	}
+	ls.errMu.Unlock()
+}
+
+func (ls *LightStreamerConnection) supervise() {
+	backoff := time.Second
+	for {
+		select {
+		case <-ls.ctx.Done():
+			ls.shutdownFinal()
+			return
+		case <-ls.reconnectCh:
+			if ls.closeRequested.Load() {
+				continue
+			}
+			for !ls.closeRequested.Load() && ls.ctx.Err() == nil {
+				if err := ls.reconnectOnce(); err == nil {
+					backoff = time.Second
+					break
+				}
+				time.Sleep(backoff)
+				if backoff < 10*time.Second {
+					backoff *= 2
+				}
+			}
+		}
+	}
+}
+
+func (ls *LightStreamerConnection) stopCurrentCycle() {
+	if ls.cycleCancel != nil {
+		ls.cycleCancel()
+		ls.cycleCancel = nil
+	}
+	if ls.heartbeatTicker != nil {
+		ls.heartbeatTicker.Stop()
+	}
+	if ls.wsConn != nil {
+		_ = ls.wsConn.Close()
+	}
+}
+
+func (ls *LightStreamerConnection) shutdownFinal() {
+	ls.closeRequested.Store(true)
+	ls.stopCurrentCycle()
+	ls.wg.Wait()
+
+	ls.subsMu.Lock()
+	marketSubs := ls.marketSubscriptions
+	chartTickSubs := ls.chartTickSubscriptions
+	chartCandleSubs := ls.chartCandleSubscriptions
+	tradeSubs := ls.tradeSubscriptions
+	ls.marketSubscriptions = nil
+	ls.chartTickSubscriptions = nil
+	ls.chartCandleSubscriptions = nil
+	ls.tradeSubscriptions = nil
+	ls.subsMu.Unlock()
+
+	for _, sub := range marketSubs {
+		safeCloseChan(sub.channel)
+	}
+	for _, sub := range chartTickSubs {
+		safeCloseChan(sub.channel)
+	}
+	for _, sub := range chartCandleSubs {
+		safeCloseChan(sub.channel)
+	}
+	for _, sub := range tradeSubs {
+		safeCloseChan(sub.channel)
+	}
+
+	safeCloseDone(ls.done)
+}
+
+func safeCloseDone(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(ch)
+}
+
+func (ls *LightStreamerConnection) reconnectOnce() error {
+	ls.stopCurrentCycle()
+	ls.wg.Wait()
+
+	if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+		return fmt.Errorf("lightstreamer connection closed")
+	}
+
+	ls.nextSubscriptionId = 1
+
+	dialCtx, cancel := context.WithTimeout(ls.ctx, 60*time.Second)
+	defer cancel()
+
+	sessionVersion2, err := ls.ig.LoginVersion2(dialCtx)
+	if err != nil {
+		return fmt.Errorf("error during login version 2: %w", err)
+	}
+
+	if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+		return fmt.Errorf("lightstreamer connection closed")
+	}
+
+	dialer := &websocket.Dialer{
+		Subprotocols:     []string{LightstreamerProtocolVersion},
+		HandshakeTimeout: 30 * time.Second,
+	}
+
+	endpoint := strings.Replace(strings.Replace(sessionVersion2.LightstreamerEndpoint, "https://", "wss://", 1), "http://", "ws://", 1)
+	ws, resp, err := dialer.DialContext(dialCtx, fmt.Sprintf("%s/lightstreamer", endpoint), http.Header{})
+	if err != nil {
+		if resp != nil {
+			respBody, readErr := io.ReadAll(resp.Body)
+			if readErr == nil && len(respBody) > 0 {
+				return fmt.Errorf("error during websockets dial (response %d : %s): %w", resp.StatusCode, respBody, err)
+			}
+			return fmt.Errorf("error during websockets dial (response %d): %w", resp.StatusCode, err)
+		}
+		return fmt.Errorf("error during websockets dial: %w", err)
+	}
+
+	ls.wsConn = ws
+
+	// to ensure creation fails if server is unresponsive for too long
+	if err := ws.SetReadDeadline(time.Now().Add(time.Second * 60)); err != nil {
+		_ = ws.Close()
+		return fmt.Errorf("error setting read deadline: %w", err)
+	}
+	if err := ws.SetWriteDeadline(time.Now().Add(time.Second * 60)); err != nil {
+		_ = ws.Close()
+		return fmt.Errorf("error setting write deadline: %w", err)
+	}
+
+	if err := ls.validateWebsocketConnection(); err != nil {
+		_ = ws.Close()
+		return err
+	}
+	if err := ls.createSession(sessionVersion2); err != nil {
+		_ = ws.Close()
+		return err
+	}
+	if err := ls.bindSession(); err != nil {
+		_ = ws.Close()
+		return err
+	}
+
+	if err := ws.SetReadDeadline(time.Time{}); err != nil {
+		_ = ws.Close()
+		return fmt.Errorf("error setting empty read deadline: %w", err)
+	}
+	if err := ws.SetWriteDeadline(time.Time{}); err != nil {
+		_ = ws.Close()
+		return fmt.Errorf("error setting empty write deadline: %w", err)
+	}
+
+	// Resubscribe existing subscriptions before starting the writer loop to avoid concurrent writes.
+	if err := ls.resubscribeAll(); err != nil {
+		_ = ws.Close()
+		ls.wsConn = nil
+		return err
+	}
+
+	cycleCtx, cycleCancel := context.WithCancel(ls.ctx)
+	ls.cycleCancel = cycleCancel
+
+	ls.heartbeatTicker = time.NewTicker(5 * time.Second)
+	ls.wg.Add(2)
+	go ls.readLoop()
+	go ls.writeLoop(cycleCtx)
+
+	return nil
+}
+
+func (ls *LightStreamerConnection) resubscribeAll() error {
+	if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+		return fmt.Errorf("lightstreamer connection closed")
+	}
+
+	ls.subsMu.RLock()
+	marketSubs := append([]*subscription[MarketTick](nil), ls.marketSubscriptions...)
+	chartTickSubs := append([]*subscription[ChartTick](nil), ls.chartTickSubscriptions...)
+	chartCandleSubs := append([]*subscription[ChartCandle](nil), ls.chartCandleSubscriptions...)
+	tradeSubs := append([]*subscription[TradeUpdate](nil), ls.tradeSubscriptions...)
+	ls.subsMu.RUnlock()
+
+	for _, sub := range marketSubs {
+		if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+			return fmt.Errorf("lightstreamer connection closed")
+		}
+		if err := ls.resubscribeMarkets(sub); err != nil {
 			return err
 		}
-		// Reuse the old subscription requests so the channels are re-used
-		for _, ms := range ls.marketSubscriptions {
-			_, err = subscribe(lsNew, lsNew.ctx, *ms)
-			if err != nil {
-				_ = lsNew.Close()
-				return err
-			}
-		}
-
-		for _, cs := range ls.chartTickSubscriptions {
-			_, err = subscribe(lsNew, lsNew.ctx, *cs)
-			if err != nil {
-				_ = lsNew.Close()
-				return err
-			}
-		}
-		for _, ts := range ls.tradeSubscriptions {
-			_, err = subscribe(lsNew, lsNew.ctx, *ts)
-			if err != nil {
-				_ = lsNew.Close()
-				return err
-			}
-		}
-		for _, cs := range ls.chartCandleSubscriptions {
-			_, err = subscribe(lsNew, lsNew.ctx, *cs)
-			if err != nil {
-				_ = lsNew.Close()
-				return err
-			}
-		}
-		ls.closeRequested.Store(true)
-		ls.cancelFunc()
-		_ = ls.wsConn.Close()
-
-		*ls = *lsNew
-		return nil
-	}, backOff, func(err error, duration time.Duration) {
-		log.Printf("lightstreamer encountered connection error (retrying in %s): %s\n", duration, err)
-	})
-	if err != nil {
-		log.Printf("lightstreamer encountered fatal error")
 	}
+	for _, sub := range chartTickSubs {
+		if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+			return fmt.Errorf("lightstreamer connection closed")
+		}
+		if err := ls.resubscribeChartTicks(sub); err != nil {
+			return err
+		}
+	}
+	for _, sub := range chartCandleSubs {
+		if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+			return fmt.Errorf("lightstreamer connection closed")
+		}
+		if err := ls.resubscribeChartCandles(sub); err != nil {
+			return err
+		}
+	}
+	for _, sub := range tradeSubs {
+		if ls.closeRequested.Load() || ls.ctx.Err() != nil {
+			return fmt.Errorf("lightstreamer connection closed")
+		}
+		if err := ls.resubscribeTradeUpdates(sub); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ls *LightStreamerConnection) resubscribeMarkets(sub *subscription[MarketTick]) error {
+	if ls.wsConn == nil || sub == nil {
+		return nil
+	}
+	ls.nextSubscriptionId++
+	sub.requestID = fmt.Sprintf("%d", rand.Int63())
+	sub.subscriptionId = fmt.Sprintf("%d", ls.nextSubscriptionId)
+	sub.lastStateByItem = make(map[string]MarketTick)
+
+	items := make([]string, len(sub.items))
+	for i, epic := range sub.items {
+		items[i] = fmt.Sprintf("MARKET:%s", epic)
+	}
+
+	ctrlVals := url.Values{}
+	ctrlVals.Set("LS_op", "add")
+	ctrlVals.Set("LS_mode", "MERGE")
+	ctrlVals.Set("LS_snapshot", "true")
+	ctrlVals.Set("LS_subId", sub.subscriptionId)
+	ctrlVals.Set("LS_group", strings.Join(items, " "))
+	ctrlVals.Set("LS_schema", marketTickFields)
+	ctrlVals.Set("LS_reqId", sub.requestID)
+	msg := []byte("control\r\n" + ctrlVals.Encode())
+	return ls.wsConn.WriteMessage(websocket.TextMessage, msg)
+}
+
+func (ls *LightStreamerConnection) resubscribeChartTicks(sub *subscription[ChartTick]) error {
+	if ls.wsConn == nil || sub == nil {
+		return nil
+	}
+	ls.nextSubscriptionId++
+	sub.requestID = fmt.Sprintf("%d", rand.Int63())
+	sub.subscriptionId = fmt.Sprintf("%d", ls.nextSubscriptionId)
+	sub.lastStateByItem = make(map[string]ChartTick)
+
+	items := make([]string, len(sub.items))
+	for i, epic := range sub.items {
+		items[i] = fmt.Sprintf("CHART:%s:TICK", epic)
+	}
+
+	ctrlVals := url.Values{}
+	ctrlVals.Set("LS_op", "add")
+	ctrlVals.Set("LS_mode", "DISTINCT")
+	ctrlVals.Set("LS_snapshot", "true")
+	ctrlVals.Set("LS_subId", sub.subscriptionId)
+	ctrlVals.Set("LS_group", strings.Join(items, " "))
+	ctrlVals.Set("LS_schema", chartTickFields)
+	ctrlVals.Set("LS_reqId", sub.requestID)
+	msg := []byte("control\r\n" + ctrlVals.Encode())
+	return ls.wsConn.WriteMessage(websocket.TextMessage, msg)
+}
+
+func (ls *LightStreamerConnection) resubscribeChartCandles(sub *subscription[ChartCandle]) error {
+	if ls.wsConn == nil || sub == nil {
+		return nil
+	}
+	ls.nextSubscriptionId++
+	sub.requestID = fmt.Sprintf("%d", rand.Int63())
+	sub.subscriptionId = fmt.Sprintf("%d", ls.nextSubscriptionId)
+	sub.lastStateByItem = make(map[string]ChartCandle)
+
+	items := make([]string, len(sub.items))
+	for i, epic := range sub.items {
+		items[i] = fmt.Sprintf("CHART:%s:%s", epic, sub.scale)
+	}
+
+	ctrlVals := url.Values{}
+	ctrlVals.Set("LS_op", "add")
+	ctrlVals.Set("LS_mode", "MERGE")
+	ctrlVals.Set("LS_snapshot", "true")
+	ctrlVals.Set("LS_subId", sub.subscriptionId)
+	ctrlVals.Set("LS_group", strings.Join(items, " "))
+	ctrlVals.Set("LS_schema", chartCandleFields)
+	ctrlVals.Set("LS_reqId", sub.requestID)
+	msg := []byte("control\r\n" + ctrlVals.Encode())
+	return ls.wsConn.WriteMessage(websocket.TextMessage, msg)
+}
+
+func (ls *LightStreamerConnection) resubscribeTradeUpdates(sub *subscription[TradeUpdate]) error {
+	if ls.wsConn == nil || sub == nil {
+		return nil
+	}
+	ls.nextSubscriptionId++
+	sub.requestID = fmt.Sprintf("%d", rand.Int63())
+	sub.subscriptionId = fmt.Sprintf("%d", ls.nextSubscriptionId)
+	sub.lastStateByItem = make(map[string]TradeUpdate)
+
+	items := make([]string, len(sub.items))
+	for i, accountID := range sub.items {
+		items[i] = fmt.Sprintf("TRADE:%s", accountID)
+	}
+
+	ctrlVals := url.Values{}
+	ctrlVals.Set("LS_op", "add")
+	ctrlVals.Set("LS_mode", "DISTINCT")
+	ctrlVals.Set("LS_snapshot", "true")
+	ctrlVals.Set("LS_subId", sub.subscriptionId)
+	ctrlVals.Set("LS_group", strings.Join(items, " "))
+	ctrlVals.Set("LS_schema", tradeFields)
+	ctrlVals.Set("LS_reqId", sub.requestID)
+	msg := []byte("control\r\n" + ctrlVals.Encode())
+	return ls.wsConn.WriteMessage(websocket.TextMessage, msg)
+}
+
+func safeCloseChan[T any](ch chan T) {
+	if ch == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(ch)
 }
 
 func (ls *LightStreamerConnection) SubscribeTradeUpdates(ctx context.Context, bufferSize int, accounts ...string) (<-chan TradeUpdate, error) {
@@ -1145,9 +1525,13 @@ func subscribe[T MarketTick | ChartTick | ChartCandle | TradeUpdate](ls *LightSt
 				return nil, err
 			}
 			return subReq.channel, nil
+		case <-ls.done:
+			return nil, fmt.Errorf("lightstreamer connection closed")
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+	case <-ls.done:
+		return nil, fmt.Errorf("lightstreamer connection closed")
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -1159,42 +1543,36 @@ func unsubscribe[T MarketTick | ChartTick | ChartCandle | TradeUpdate](ls *Light
 	}
 	unsubReq := unsubscription[T]{
 		channel: tickChan,
-		errChan: make(chan error),
+		errChan: make(chan error, 1),
 	}
-	ls.subscriptionReqChan <- unsubReq
-	return <-unsubReq.errChan
+	select {
+	case ls.subscriptionReqChan <- unsubReq:
+	case <-ls.done:
+		return fmt.Errorf("lightstreamer connection closed")
+	}
+
+	select {
+	case err := <-unsubReq.errChan:
+		return err
+	case <-ls.done:
+		return fmt.Errorf("lightstreamer connection closed")
+	}
 }
 
 func (ls *LightStreamerConnection) Close() error {
-	ls.closeRequested.Store(true)
-	ls.cancelFunc()
-
-	defer func() {
-		for _, sub := range ls.marketSubscriptions {
-			close(sub.channel)
+	if ls.closeRequested.Swap(true) {
+		if ls.done != nil {
+			<-ls.done
 		}
-		for _, sub := range ls.chartTickSubscriptions {
-			close(sub.channel)
-		}
-		for _, sub := range ls.chartCandleSubscriptions {
-			close(sub.channel)
-		}
-		ls.chartTickSubscriptions = nil
-		ls.marketSubscriptions = nil
-		ls.chartCandleSubscriptions = nil
-	}()
-
-	err := ls.wsConn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, ""), time.Time{})
-
-	if err != nil {
-		return err
+		return nil
 	}
-	err = ls.wsConn.Close()
-
-	if err != nil {
-		return err
+	if ls.cancelFunc != nil {
+		ls.cancelFunc()
 	}
-
+	ls.stopCurrentCycle()
+	if ls.done != nil {
+		<-ls.done
+	}
 	return nil
 }
 

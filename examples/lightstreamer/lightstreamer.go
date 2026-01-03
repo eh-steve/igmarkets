@@ -42,21 +42,20 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = igHandle.Login(ctx)
-
-		if err != nil {
-			log.Fatal(err)
-		}
-
 		tickChan, err := lsConn.SubscribeMarkets(ctx, 100, conf.epics...)
 		if err != nil {
+			_ = lsConn.Close()
 			log.WithError(err).Error("open stream fialed")
+			continue
 		}
 
 		for tick := range tickChan {
 			log.Infof("tick: %+v", tick)
 		}
 
+		if err := lsConn.Close(); err != nil {
+			log.WithError(err).Warn("stream ended")
+		}
 		log.Infof("Server closed stream, restarting...")
 	}
 }
