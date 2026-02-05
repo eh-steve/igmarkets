@@ -22,6 +22,19 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// ConnectionStatus represents the current state of the Lightstreamer connection.
+type ConnectionStatus string
+
+const (
+	ConnectionStatusConnected    ConnectionStatus = "connected"
+	ConnectionStatusDisconnected ConnectionStatus = "disconnected"
+	ConnectionStatusReconnecting ConnectionStatus = "reconnecting"
+)
+
+// ConnectionStatusCallback is called when the Lightstreamer connection status changes.
+// The callback receives the new status and an optional error (for disconnections).
+type ConnectionStatusCallback func(status ConnectionStatus, err error)
+
 type LightStreamerConnection struct {
 	ig                       *IGMarkets
 	sessionID                string
@@ -46,6 +59,8 @@ type LightStreamerConnection struct {
 	tradeSubscriptions       []*subscription[TradeUpdate]
 	priceTimestampsByEpic    map[string]struct{ fetchTime, priceTime time.Time }
 	subscriptionReqChan      chan interface{}
+	connectionStatusCallback ConnectionStatusCallback
+	connectionStatusMu       sync.RWMutex
 }
 
 type subscription[T MarketTick | ChartTick | ChartCandle | TradeUpdate] struct {
@@ -442,6 +457,34 @@ func (ig *IGMarkets) NewLightStreamerConnection(ctx context.Context) (*LightStre
 	go lsConn.supervise()
 
 	return lsConn, nil
+}
+
+// SetConnectionStatusCallback sets a callback that will be invoked when the
+// connection status changes (connected, disconnected, reconnecting).
+// This should be called immediately after creating the connection.
+func (ls *LightStreamerConnection) SetConnectionStatusCallback(callback ConnectionStatusCallback) {
+	ls.connectionStatusMu.Lock()
+	ls.connectionStatusCallback = callback
+	ls.connectionStatusMu.Unlock()
+}
+
+// emitConnectionStatus safely calls the connection status callback if set.
+func (ls *LightStreamerConnection) emitConnectionStatus(status ConnectionStatus, err error) {
+	ls.connectionStatusMu.RLock()
+	callback := ls.connectionStatusCallback
+	ls.connectionStatusMu.RUnlock()
+
+	if callback != nil {
+		// Call in a goroutine to avoid blocking the reconnect loop
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic in connection status callback: %v", r)
+				}
+			}()
+			callback(status, err)
+		}()
+	}
 }
 
 func (ls *LightStreamerConnection) validateWebsocketConnection() error {
@@ -1107,6 +1150,10 @@ func (ls *LightStreamerConnection) fatalError(err error) {
 	}
 	log.Printf("lightstreamer connection error: %v\n", err)
 	ls.setLastError(err)
+
+	// Notify callback that connection is lost
+	ls.emitConnectionStatus(ConnectionStatusDisconnected, err)
+
 	select {
 	case ls.reconnectCh <- err:
 	default:
@@ -1135,8 +1182,13 @@ func (ls *LightStreamerConnection) supervise() {
 			if ls.closeRequested.Load() {
 				continue
 			}
+			// Notify callback that we're attempting to reconnect
+			ls.emitConnectionStatus(ConnectionStatusReconnecting, nil)
+
 			for !ls.closeRequested.Load() && ls.ctx.Err() == nil {
 				if err := ls.reconnectOnce(); err == nil {
+					// Successfully reconnected - emit connected status
+					ls.emitConnectionStatus(ConnectionStatusConnected, nil)
 					backoff = time.Second
 					break
 				}
