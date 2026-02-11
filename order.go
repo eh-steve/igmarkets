@@ -8,17 +8,22 @@ import (
 	"net/http"
 )
 
-// OTCPositionCloseRequest - request struct for closing positions
+// OTCPositionCloseRequest - request struct for closing positions.
+// Sent as POST with _method:DELETE header. The IG server applies POST validation
+// so all POST v1 [Constraint: NotNull] fields must be present even for closes.
 type OTCPositionCloseRequest struct {
-	DealID      string  `json:"dealId,omitempty"`
-	Direction   string  `json:"direction"` // "BUY" or "SELL"
-	Epic        string  `json:"epic,omitempty"`
-	Expiry      string  `json:"expiry,omitempty"`
-	Level       string  `json:"level,omitempty"`
-	OrderType   string  `json:"orderType"`
-	QuoteID     string  `json:"quoteId,omitempty"`
-	Size        float64 `json:"size"`                  // Deal size
-	TimeInForce string  `json:"timeInForce,omitempty"` // "EXECUTE_AND_ELIMINATE" or "FILL_OR_KILL"
+	CurrencyCode   string  `json:"currencyCode"`
+	DealID         string  `json:"dealId,omitempty"`
+	Direction      string  `json:"direction"` // "BUY" or "SELL"
+	Epic           string  `json:"epic"`
+	Expiry         string  `json:"expiry"`
+	ForceOpen      bool    `json:"forceOpen"`
+	GuaranteedStop bool    `json:"guaranteedStop"`
+	Level          string  `json:"level,omitempty"`
+	OrderType      string  `json:"orderType"`
+	QuoteID        string  `json:"quoteId,omitempty"`
+	Size           float64 `json:"size"`                  // Deal size
+	TimeInForce    string  `json:"timeInForce,omitempty"` // "EXECUTE_AND_ELIMINATE" or "FILL_OR_KILL"
 }
 
 // AffectedDeal - part of order confirmation
@@ -262,7 +267,9 @@ func (ig *IGMarkets) UpdateOTCOrder(ctx context.Context, dealID string, order OT
 	return igResponseInterface.(*DealReference), err
 }
 
-// CloseOTCPosition - Close an OTC position
+// CloseOTCPosition - Close an OTC position.
+// Uses POST with _method:DELETE header because the IG API requires a request
+// body for closes, and DELETE with a body is unreliable across HTTP infrastructure.
 func (ig *IGMarkets) CloseOTCPosition(ctx context.Context, close OTCPositionCloseRequest) (*DealReference, error) {
 	bodyReq, err := json.Marshal(&close)
 	if err != nil {
