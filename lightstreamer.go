@@ -841,8 +841,9 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 				return
 			}
 			epic := sub.items[itemIdIndex]
-			lastState := sub.lastStateByItem[epic]
-			chartTick := lastState
+			// Chart tick subscriptions use DISTINCT mode — each update is
+			// independent, so don't carry over lastState.
+			var chartTick ChartTick
 			chartTick.Epic = epic
 			chartTick.RecvTime = time.Now()
 			chartTick.RawUpdate = args[3]
@@ -896,8 +897,11 @@ func (ls *LightStreamerConnection) handleUpdate(args []string) {
 				return
 			}
 			accountID := sub.items[itemIdIndex]
-			lastState := sub.lastStateByItem[accountID]
-			tradeUpdate := lastState
+			// Trade subscriptions use DISTINCT mode — each update is an
+			// independent event.  Do NOT carry over lastState, otherwise
+			// stale Confirms/OPU pointers bleed into unrelated events
+			// (e.g. an OPU re-delivers the previous CONFIRMS).
+			var tradeUpdate TradeUpdate
 			tradeUpdate.AccountID = accountID
 			tradeUpdate.RecvTime = time.Now()
 			tradeUpdate.RawUpdate = args[3]
