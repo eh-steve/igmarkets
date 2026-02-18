@@ -142,6 +142,9 @@ func (ig *IGMarkets) Login(ctx context.Context) error {
 	ig.Lock()
 	ig.OAuthToken = session.OAuthToken
 	ig.TimeZone = timeZoneOffset2Location(session.TimezoneOffset)
+	if ig.AccountID == "" && session.AccountId != "" {
+		ig.AccountID = session.AccountId
+	}
 	ig.Unlock()
 
 	return nil
