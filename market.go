@@ -119,7 +119,7 @@ func (ig *IGMarkets) MarketSearch(ctx context.Context, term string) (*MarketSear
 		return nil, fmt.Errorf("igmarkets: unable to get markets data: %v", err)
 	}
 
-	igResponseInterface, err := ig.doRequest(ctx, req, 1, MarketSearchResponse{})
+	igResponseInterface, err := ig.doRequestCST(ctx, req, 1, MarketSearchResponse{})
 	if err != nil {
 		return nil, err
 	}

@@ -58,18 +58,25 @@ func New(apiURL, apiKey, accountID, identifier, password string) *IGMarkets {
 }
 
 func (ig *IGMarkets) doRequestWithoutOAuth(ctx context.Context, req *http.Request, endpointVersion int, igResponse interface{}) (interface{}, error) {
-	object, _, err := ig.doRequestWithResponseHeaders(ctx, req, endpointVersion, igResponse, false)
+	object, _, err := ig.doRequestWithResponseHeaders(ctx, req, endpointVersion, igResponse, false, false)
 	return object, err
 }
 
 func (ig *IGMarkets) doRequest(ctx context.Context, req *http.Request, endpointVersion int, igResponse interface{}) (interface{}, error) {
-	object, _, err := ig.doRequestWithResponseHeaders(ctx, req, endpointVersion, igResponse, true)
+	object, _, err := ig.doRequestWithResponseHeaders(ctx, req, endpointVersion, igResponse, true, false)
 	return object, err
 }
 
-func (ig *IGMarkets) doRequestWithResponseHeaders(ctx context.Context, req *http.Request, endpointVersion int, igResponse interface{}, oAuth bool) (interface{}, http.Header, error) {
+// doRequestCST forces CST/X-SECURITY-TOKEN auth instead of OAuth.
+// Required for endpoints like MarketSearch that reject OAuth Bearer tokens.
+func (ig *IGMarkets) doRequestCST(ctx context.Context, req *http.Request, endpointVersion int, igResponse interface{}) (interface{}, error) {
+	object, _, err := ig.doRequestWithResponseHeaders(ctx, req, endpointVersion, igResponse, false, true)
+	return object, err
+}
+
+func (ig *IGMarkets) doRequestWithResponseHeaders(ctx context.Context, req *http.Request, endpointVersion int, igResponse interface{}, oAuth bool, forceCST bool) (interface{}, http.Header, error) {
 	ig.RLock()
-	if ig.CSTToken != "" {
+	if forceCST && ig.CSTToken != "" {
 		req.Header.Set("CST", ig.CSTToken)
 		if ig.XSecurityToken != "" {
 			req.Header.Set("X-SECURITY-TOKEN", ig.XSecurityToken)

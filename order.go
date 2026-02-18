@@ -9,21 +9,18 @@ import (
 )
 
 // OTCPositionCloseRequest - request struct for closing positions.
-// Sent as POST with _method:DELETE header. The IG server applies POST validation
-// so all POST v1 [Constraint: NotNull] fields must be present even for closes.
+// Sent as POST with _method:DELETE header.
+// Identify the position by DealID *or* Epic+Expiry — these are mutually exclusive.
 type OTCPositionCloseRequest struct {
-	CurrencyCode   string  `json:"currencyCode"`
-	DealID         string  `json:"dealId,omitempty"`
-	Direction      string  `json:"direction"` // "BUY" or "SELL"
-	Epic           string  `json:"epic"`
-	Expiry         string  `json:"expiry"`
-	ForceOpen      bool    `json:"forceOpen"`
-	GuaranteedStop bool    `json:"guaranteedStop"`
-	Level          string  `json:"level,omitempty"`
-	OrderType      string  `json:"orderType"`
-	QuoteID        string  `json:"quoteId,omitempty"`
-	Size           float64 `json:"size"`                  // Deal size
-	TimeInForce    string  `json:"timeInForce,omitempty"` // "EXECUTE_AND_ELIMINATE" or "FILL_OR_KILL"
+	DealID      string  `json:"dealId,omitempty"`
+	Epic        string  `json:"epic,omitempty"`
+	Expiry      string  `json:"expiry,omitempty"`
+	Direction   string  `json:"direction"`
+	Size        float64 `json:"size"`
+	OrderType   string  `json:"orderType"`
+	TimeInForce string  `json:"timeInForce,omitempty"`
+	Level       string  `json:"level,omitempty"`
+	QuoteID     string  `json:"quoteId,omitempty"`
 }
 
 // AffectedDeal - part of order confirmation
