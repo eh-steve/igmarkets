@@ -176,6 +176,11 @@ func (ig *IGMarkets) LoginVersion2(ctx context.Context) (*SessionVersion2, error
 	if headers != nil {
 		session.CSTToken = headers.Get("CST")
 		session.XSTToken = headers.Get("X-SECURITY-TOKEN")
+
+		ig.Lock()
+		ig.CSTToken = session.CSTToken
+		ig.XSecurityToken = session.XSTToken
+		ig.Unlock()
 	}
 	return session, nil
 }

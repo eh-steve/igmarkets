@@ -29,6 +29,8 @@ type IGMarkets struct {
 	TimeZone              *time.Location
 	TimeZoneLightStreamer *time.Location
 	OAuthToken            OAuthToken
+	CSTToken              string
+	XSecurityToken        string
 	httpClient            *http.Client
 	sync.RWMutex
 }
@@ -67,11 +69,18 @@ func (ig *IGMarkets) doRequest(ctx context.Context, req *http.Request, endpointV
 
 func (ig *IGMarkets) doRequestWithResponseHeaders(ctx context.Context, req *http.Request, endpointVersion int, igResponse interface{}, oAuth bool) (interface{}, http.Header, error) {
 	ig.RLock()
-	if ig.OAuthToken.AccessToken != "" && oAuth {
+	if ig.CSTToken != "" {
+		req.Header.Set("CST", ig.CSTToken)
+		if ig.XSecurityToken != "" {
+			req.Header.Set("X-SECURITY-TOKEN", ig.XSecurityToken)
+		}
+	} else if ig.OAuthToken.AccessToken != "" && oAuth {
 		req.Header.Set("Authorization", "Bearer "+ig.OAuthToken.AccessToken)
 	}
 	req.Header.Set("X-IG-API-KEY", ig.APIKey)
-	req.Header.Set("IG-ACCOUNT-ID", ig.AccountID)
+	if ig.AccountID != "" {
+		req.Header.Set("IG-ACCOUNT-ID", ig.AccountID)
+	}
 	ig.RUnlock()
 
 	req.Header.Set("Accept", "application/json; charset=UTF-8")
